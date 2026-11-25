@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -701,6 +701,14 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_fence_requires_real_completion() {
+        assert!(!super::copy_fence_completed(6, 7));
+        assert!(super::copy_fence_completed(7, 7));
+        assert!(super::copy_fence_completed(8, 7));
+        assert!(!super::copy_fence_completed(u64::MAX, 7));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -2124,6 +2132,10 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// fetched pieces the old way, microseconds the thread that lands flights
 /// waited for the staged slots to come down, and their bytes.
 static INFLIGHT_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn copy_fence_completed(completed: u64, sent: u64) -> bool {
+    completed != u64::MAX && completed >= sent
+}
 
 /// After a fetch the old way taken with the queue's count at `after`, for
 /// plans whose highest send is `landed`: up to which send the notes of
@@ -4059,22 +4071,25 @@ impl Host {
             let work = work.as_ref()?;
             let inflight = work.inflight.as_ref()?;
             let dwords = (work.differs.2 / 4) as usize;
-            // SAFETY: the mappings of the results, the counters and the
-            // entries. The compares and fetches of these plans have run, and
-            // their dwords and regions are given to no other plan before
-            // these are done with (`card_done`, `inflight_regions_landed`).
-            let (differs, counters, entries) = unsafe {
-                (
-                    std::slice::from_raw_parts(work.differs.1 as *const u32, dwords),
-                    std::slice::from_raw_parts(inflight.table.1 as *const u32, inflight.slots as usize),
-                    std::slice::from_raw_parts((inflight.table.1 as *const u32).add(inflight.slots as usize), dwords),
-                )
+            // Read only the words owned by the landed plans, and read them
+            // volatile: newer flights may still write other words through
+            // the GPU while this landing is inspected.
+            let differs = work.differs.1 as *const u32;
+            let counters = inflight.table.1 as *const u32;
+            // SAFETY: `table` has one counter per slot before the entries.
+            let entries = unsafe { counters.add(inflight.slots as usize) };
+            let read = |at: usize, words: usize, from: *const u32| {
+                (at < words).then(|| {
+                    // SAFETY: the caller supplied a mapped result buffer and
+                    // this index was checked against its extent.
+                    unsafe { from.add(at).read_volatile() }
+                })
             };
             let mut seen_left = std::collections::HashSet::new();
             for plan in plans {
                 let region = plan.region.filter(|_| plan.inflight);
                 if let Some((base, count)) = region {
-                    let used = counters.get(base as usize).copied().unwrap_or(0).min(count);
+                    let used = read(base as usize, inflight.slots as usize, counters).unwrap_or(0).min(count);
                     if used > 0 {
                         down.push((base, used));
                     }
@@ -4086,11 +4101,12 @@ impl Host {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let at = (r.at + p) as usize;
-                        let flagged = !r.compared || differs.get(at).is_none_or(|&d| d != 0);
+                        let flag = read(at, dwords, differs);
+                        let flagged = !r.compared || flag.is_none_or(|d| d != 0);
                         if flagged
                             && r.compared
                             && let Some((_, count)) = region
-                            && let Some(&k) = entries.get(at)
+                            && let Some(k) = read(at, dwords, entries)
                             && k != INFLIGHT_NONE
                             && k < count
                         {
@@ -4196,9 +4212,15 @@ impl Host {
                 list.Close()?;
                 queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
                 queue.Signal(&fence, sent)?;
-                if fence.GetCompletedValue() < sent {
+                if !copy_fence_completed(fence.GetCompletedValue(), sent) {
                     fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
+                    if WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0 {
+                        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+                    }
+                }
+                self.device.GetDeviceRemovedReason()?;
+                if !copy_fence_completed(fence.GetCompletedValue(), sent) {
+                    return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
                 }
                 Ok(())
             })()
